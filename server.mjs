@@ -140,14 +140,7 @@ let wallet = null;
 if (PRIVATE_KEY && PRIVATE_KEY.trim()) {
   try {
     const sk = bs58.decode(PRIVATE_KEY.trim());
-    wallet = Keypair.fromSecretKey(sk);
-    console.log('[wallet]', wallet.publicKey.toBase58());
-  } catch (e) {
-    console.error('[wallet] failed:', e.message);
-  }
-}
-
-let tradingService = null;
+    wallet = Keypair.fromSecrlet tradingService = null;
 if (wallet) {
   try {
     tradingService = createPumpTradingService({
@@ -157,6 +150,17 @@ if (wallet) {
       pumpswapProgramId: PUMPSWAP_PROGRAM_ID,
     });
     console.log('[trading] Pump trading service initialized');
+    
+    // Test RPC connection
+    tradingService.testRPCConnection().then(() => {
+      console.log('[trading] ✅ RPC connection test passed');
+    }).catch((error) => {
+      console.error('[trading] ❌ RPC connection test failed:', error.message);
+    });
+  } catch (e) {
+    console.error('[trading] failed to init trading service:', e.message);
+  }
+}   console.log('[trading] Pump trading service initialized');
   } catch (e) {
     console.error('[trading] failed to init trading service:', e.message);
   }
@@ -524,34 +528,30 @@ async function processGraduation(mint, baseVaultAddr, quoteVaultAddr, poolAddres
       } else {
         connection.removeAccountChangeListener(monitor.subscriptionId);
       }
-      realTimePriceMonitors.delete(mint);
-    } catch (removeError) {
-      console.error(`[graduation] Error removing monitor:`, removeError.message);
-    }
-  }
-
-  // Start PumpSwap monitoring
-  setupVaultPriceMonitoring(mint, baseVaultAddr, quoteVaultAddr);
-  
-  // Broadcast update
-  broadcast({ 
-    type: 'priceUpdate', 
-    coin: { 
-      mint, 
-      status: 'pumpswap',
-      baseVault: baseVaultAddr,
-      quoteVault: quoteVaultAddr
-    } 
-  });
-
-  console.log(`[graduation] ✅ Successfully graduated ${coin.symbol || mint} to PumpSwap monitoring`);
-}
-
-/**
+      realTimePriceMonitors.delete(m/**
  * Find PumpSwap pool data for a given mint
  */
 async function findPumpSwapPool(mint) {
   try {
+    // First try to derive the pool PDA
+    const poolPDA = derivePumpSwapPoolPDA(mint);
+    const poolAccount = await connection.getAccountInfo(poolPDA, 'processed');
+    
+    if (poolAccount) {
+      console.log(`[pool-discovery] Found PumpSwap pool PDA for ${mint} at ${poolPDA.toBase58()}`);
+      
+      // Derive vault PDAs
+      const baseVault = derivePumpSwapTokenVaultPDA(poolPDA.toBase58());
+      const quoteVault = derivePumpSwapSolVaultPDA(poolPDA.toBase58());
+      
+      return {
+        poolAddress: poolPDA.toBase58(),
+        baseVault: baseVault.toBase58(),
+        quoteVault: quoteVault.toBase58(),
+      };
+    }
+
+    // Fallback to program accounts search
     const baseMint = new PublicKey(mint);
     const filters = [
       {
@@ -580,6 +580,57 @@ async function findPumpSwapPool(mint) {
     }
 
     const baseVaultOffset = 139;
+    const quoteVaultOffset = 171;
+
+    const baseVault = new PublicKey(data.slice(baseVaultOffset, baseVaultOffset + 32)).toBase58();
+    const quoteVault = new PublicKey(data.slice(quoteVaultOffset, quoteVaultOffset + 32)).toBase58();
+    const poolAddress = account.pubkey.toBase58();
+
+    console.log(`[pool-discovery] Found PumpSwap pool for ${mint} at ${poolAddress}`);
+
+    return {
+      poolAddress,
+      baseVault,
+      quoteVault,
+    };
+  } catch (error) {
+    console.error(`[pool-discovery] Error finding pool for ${mint}:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Derive PumpSwap pool PDA for a given token mint
+ */
+function derivePumpSwapPoolPDA(tokenMint) {
+  const mint = new PublicKey(tokenMint);
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('pool'), mint.toBuffer()],
+    PUMPSWAP_PROGRAM_ID
+  )[0];
+}
+
+/**
+ * Derive PumpSwap pool token vault PDA
+ */
+function derivePumpSwapTokenVaultPDA(poolAddress) {
+  const pool = new PublicKey(poolAddress);
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('token_vault'), pool.toBuffer()],
+    PUMPSWAP_PROGRAM_ID
+  )[0];
+}
+
+/**
+ * Derive PumpSwap pool SOL vault PDA
+ */
+function derivePumpSwapSolVaultPDA(poolAddress) {
+  const pool = new PublicKey(poolAddress);
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('sol_vault'), pool.toBuffer()],
+    PUMPSWAP_PROGRAM_ID
+  )[0];
+}9;
     const quoteVaultOffset = 171;
 
     const baseVault = new PublicKey(data.slice(baseVaultOffset, baseVaultOffset + 32)).toBase58();
@@ -755,10 +806,16 @@ async function tradeWithGraduationFallback({
 
     let pool = swapParams.pool || coinRef?.ammId || lastKnownPool || null;
     if (!pool) {
-      const err = new Error('Liquidity migrated to Raydium, but the PumpSwap pool is not ready yet. Try again soon.');
-      err.code = 'PUMPSWAP_POOL_NOT_READY';
-      err.__solana = { reason: reason || 'PUMPSWAP_POOL_NOT_READY', message: err.message };
-      throw err;
+      // Try to find the pool using the new function
+      try {
+        pool = await tradingService.getGraduatedPoolAddress(mint);
+        console.log(`[pump-trading] Found pool for graduated coin: ${pool}`);
+      } catch (error) {
+        const err = new Error('Liquidity migrated to PumpSwap, but the pool is not ready yet. Try again soon.');
+        err.code = 'PUMPSWAP_POOL_NOT_READY';
+        err.__solana = { reason: reason || 'PUMPSWAP_POOL_NOT_READY', message: err.message };
+        throw err;
+      }
     }
 
     pool = String(pool);
@@ -2382,6 +2439,48 @@ app.post('/api/trade/pumpswap', async (req, res) => {
   } catch (error) {
     console.error('[trade:pumpswap] Failed to submit trade:', error);
     res.status(500).json({ error: error.message || 'PumpSwap trade failed' });
+  }
+});
+
+// Test endpoint for PumpSwap functionality
+app.get('/api/test/pumpswap/:mint', async (req, res) => {
+  if (!tradingService) {
+    return res.status(400).json({ error: 'Trading wallet not configured' });
+  }
+
+  try {
+    const { mint } = req.params;
+    
+    // Test RPC connection
+    await tradingService.testRPCConnection();
+    
+    // Try to find pool for the mint
+    const poolAddress = await tradingService.getGraduatedPoolAddress(mint);
+    
+    // Get pool info
+    const poolInfo = await tradingService.getPoolInfo(mint);
+    
+    res.json({
+      ok: true,
+      mint,
+      poolAddress,
+      poolInfo: {
+        address: poolInfo.address,
+        tokenMint: poolInfo.tokenMint.toBase58(),
+        tokenVault: poolInfo.tokenVault.toBase58(),
+        solVault: poolInfo.solVault.toBase58(),
+        tokenReserve: poolInfo.tokenReserve.toString(),
+        solReserve: poolInfo.solReserve.toString(),
+        feeNumerator: poolInfo.feeNumerator.toString(),
+        feeDenominator: poolInfo.feeDenominator.toString()
+      }
+    });
+  } catch (error) {
+    console.error('[test:pumpswap] Test failed:', error);
+    res.status(500).json({ 
+      error: error.message || 'PumpSwap test failed',
+      details: error.toString()
+    });
   }
 });
 
