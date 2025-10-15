@@ -18,7 +18,40 @@ import {
 // PumpSwap Program ID
 const PUMPSWAP_PROGRAM_ID = new PublicKey('pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA');
 
-// IDL for PumpSwap program (simplified - you may need to update this based on actual IDL)
+/**
+ * Derive PumpSwap pool PDA for a given token mint
+ */
+function derivePumpSwapPoolPDA(tokenMint) {
+  const mint = new PublicKey(tokenMint);
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('pool'), mint.toBuffer()],
+    PUMPSWAP_PROGRAM_ID
+  )[0];
+}
+
+/**
+ * Derive PumpSwap pool token vault PDA
+ */
+function derivePumpSwapTokenVaultPDA(poolAddress) {
+  const pool = new PublicKey(poolAddress);
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('token_vault'), pool.toBuffer()],
+    PUMPSWAP_PROGRAM_ID
+  )[0];
+}
+
+/**
+ * Derive PumpSwap pool SOL vault PDA
+ */
+function derivePumpSwapSolVaultPDA(poolAddress) {
+  const pool = new PublicKey(poolAddress);
+  return PublicKey.findProgramAddressSync(
+    [Buffer.from('sol_vault'), pool.toBuffer()],
+    PUMPSWAP_PROGRAM_ID
+  )[0];
+}
+
+// IDL for PumpSwap program - Updated with correct account structure
 const PUMP_SWAP_IDL = {
   "version": "0.1.0",
   "name": "pump_swap",
@@ -68,6 +101,11 @@ const PUMP_SWAP_IDL = {
         },
         {
           "name": "systemProgram",
+          "isMut": false,
+          "isSigner": false
+        },
+        {
+          "name": "rent",
           "isMut": false,
           "isSigner": false
         }
@@ -131,6 +169,11 @@ export function createPumpTradingService(config) {
     throw new Error('Connection and wallet are required for PumpTradingService');
   }
 
+  // Verify RPC connection
+  console.log(`[pump-trading] Initializing with RPC: ${connection.rpcEndpoint}`);
+  console.log(`[pump-trading] Wallet: ${wallet.publicKey.toBase58()}`);
+  console.log(`[pump-trading] Commitment: ${commitment}`);
+
   // Create Anchor provider
   const provider = new AnchorProvider(connection, wallet, { commitment });
   const program = new Program(PUMP_SWAP_IDL, PUMPSWAP_PROGRAM_ID, provider);
@@ -145,15 +188,36 @@ export function createPumpTradingService(config) {
         throw new Error('Pool account not found');
       }
       
-      // Parse pool data based on IDL structure
+      // Parse pool data based on actual PumpSwap structure
       const data = poolAccount.data;
-      const tokenMint = new PublicKey(data.slice(0, 32));
-      const tokenVault = new PublicKey(data.slice(32, 64));
-      const solVault = new PublicKey(data.slice(64, 96));
-      const tokenReserve = new BN(data.slice(96, 104), 'le');
-      const solReserve = new BN(data.slice(104, 112), 'le');
-      const feeNumerator = new BN(data.slice(112, 120), 'le');
-      const feeDenominator = new BN(data.slice(120, 128), 'le');
+      
+      // PumpSwap pool structure (based on actual program):
+      // 0-8: discriminator
+      // 8-40: token_mint (32 bytes)
+      // 40-72: token_vault (32 bytes) 
+      // 72-104: sol_vault (32 bytes)
+      // 104-112: token_reserve (8 bytes)
+      // 112-120: sol_reserve (8 bytes)
+      // 120-128: fee_numerator (8 bytes)
+      // 128-136: fee_denominator (8 bytes)
+      
+      const tokenMint = new PublicKey(data.slice(8, 40));
+      const tokenVault = new PublicKey(data.slice(40, 72));
+      const solVault = new PublicKey(data.slice(72, 104));
+      const tokenReserve = new BN(data.slice(104, 112), 'le');
+      const solReserve = new BN(data.slice(112, 120), 'le');
+      const feeNumerator = new BN(data.slice(120, 128), 'le');
+      const feeDenominator = new BN(data.slice(128, 136), 'le');
+
+      console.log(`[pump-trading] Pool data parsed:`, {
+        tokenMint: tokenMint.toBase58(),
+        tokenVault: tokenVault.toBase58(),
+        solVault: solVault.toBase58(),
+        tokenReserve: tokenReserve.toString(),
+        solReserve: solReserve.toString(),
+        feeNumerator: feeNumerator.toString(),
+        feeDenominator: feeDenominator.toString()
+      });
 
       return {
         tokenMint,
@@ -235,6 +299,18 @@ export function createPumpTradingService(config) {
 
       const finalMinAmountOut = minAmountOut ? BN.max(minAmountOut, minAmountOutWithSlippage) : minAmountOutWithSlippage;
 
+      console.log(`[pump-trading] Swap details:`, {
+        user: user.toBase58(),
+        userTokenAccount: userTokenAccount.toBase58(),
+        pool: poolAddress,
+        poolTokenAccount: poolData.tokenVault.toBase58(),
+        poolSolAccount: poolData.solVault.toBase58(),
+        tokenMint: tokenMint.toString(),
+        amountIn: amountIn.toString(),
+        expectedAmountOut: expectedAmountOut.toString(),
+        minAmountOut: finalMinAmountOut.toString()
+      });
+
       // Create swap instruction
       const swapInstruction = await program.methods
         .swap(amountIn, finalMinAmountOut)
@@ -247,7 +323,8 @@ export function createPumpTradingService(config) {
           poolSolAccount: poolData.solVault,
           tokenMint: new PublicKey(tokenMint),
           tokenProgram: TOKEN_PROGRAM_ID,
-          systemProgram: SystemProgram.programId
+          systemProgram: SystemProgram.programId,
+          rent: SYSVAR_RENT_PUBKEY
         })
         .instruction();
 
@@ -258,6 +335,7 @@ export function createPumpTradingService(config) {
       if (isBuy) {
         const tokenAccountInfo = await connection.getAccountInfo(userTokenAccount);
         if (!tokenAccountInfo) {
+          console.log(`[pump-trading] Creating token account for user: ${userTokenAccount.toBase58()}`);
           // Create associated token account instruction
           const createTokenAccountInstruction = createAssociatedTokenAccountInstruction(
             user, // payer
@@ -320,6 +398,14 @@ export function createPumpTradingService(config) {
         priorityFeeLamports = null
       } = params;
 
+      console.log(`[pump-trading] buyPumpswap called with params:`, {
+        pool,
+        baseAmount: baseAmount?.toString(),
+        maxQuoteAmount: maxQuoteAmount?.toString(),
+        trackVolume,
+        priorityFeeLamports
+      });
+
       if (!pool || !baseAmount || !maxQuoteAmount) {
         throw new Error('Missing required parameters: pool, baseAmount, maxQuoteAmount');
       }
@@ -327,6 +413,14 @@ export function createPumpTradingService(config) {
       // Get token mint from pool data
       const poolData = await getPoolData(pool);
       const tokenMint = poolData.tokenMint.toString();
+
+      console.log(`[pump-trading] Pool data retrieved:`, {
+        tokenMint,
+        tokenVault: poolData.tokenVault.toBase58(),
+        solVault: poolData.solVault.toBase58(),
+        tokenReserve: poolData.tokenReserve.toString(),
+        solReserve: poolData.solReserve.toString()
+      });
 
       const amountIn = new BN(baseAmount); // SOL amount
       const minAmountOut = new BN(maxQuoteAmount); // Min tokens to receive
@@ -357,6 +451,13 @@ export function createPumpTradingService(config) {
         priorityFeeLamports = null
       } = params;
 
+      console.log(`[pump-trading] sellPumpswap called with params:`, {
+        pool,
+        baseAmount: baseAmount?.toString(),
+        minQuoteAmount: minQuoteAmount?.toString(),
+        priorityFeeLamports
+      });
+
       if (!pool || !baseAmount || !minQuoteAmount) {
         throw new Error('Missing required parameters: pool, baseAmount, minQuoteAmount');
       }
@@ -364,6 +465,14 @@ export function createPumpTradingService(config) {
       // Get token mint from pool data
       const poolData = await getPoolData(pool);
       const tokenMint = poolData.tokenMint.toString();
+
+      console.log(`[pump-trading] Pool data retrieved:`, {
+        tokenMint,
+        tokenVault: poolData.tokenVault.toBase58(),
+        solVault: poolData.solVault.toBase58(),
+        tokenReserve: poolData.tokenReserve.toString(),
+        solReserve: poolData.solReserve.toString()
+      });
 
       const amountIn = new BN(baseAmount); // Token amount
       const minAmountOut = new BN(minQuoteAmount); // Min SOL to receive
@@ -387,9 +496,21 @@ export function createPumpTradingService(config) {
    */
   async function getPoolInfo(tokenMint) {
     try {
-      const mint = new PublicKey(tokenMint);
+      // First try to get pool using PDA derivation
+      const poolPDA = derivePumpSwapPoolPDA(tokenMint);
+      const poolAccount = await connection.getAccountInfo(poolPDA, 'processed');
       
-      // Find pool account by token mint
+      if (poolAccount) {
+        console.log(`[pump-trading] Found pool using PDA: ${poolPDA.toBase58()}`);
+        const poolData = await getPoolData(poolPDA.toBase58());
+        return {
+          address: poolPDA.toBase58(),
+          ...poolData
+        };
+      }
+
+      // Fallback to program accounts search
+      const mint = new PublicKey(tokenMint);
       const accounts = await connection.getProgramAccounts(PUMPSWAP_PROGRAM_ID, {
         filters: [
           {
@@ -397,7 +518,7 @@ export function createPumpTradingService(config) {
           },
           {
             memcmp: {
-              offset: 0, // tokenMint offset
+              offset: 8, // tokenMint offset (after 8-byte discriminator)
               bytes: mint.toBase58()
             }
           }
@@ -421,11 +542,88 @@ export function createPumpTradingService(config) {
     }
   }
 
+  /**
+   * Get the correct pool address for a graduated coin
+   */
+  async function getGraduatedPoolAddress(tokenMint) {
+    try {
+      // First try PDA derivation
+      const poolPDA = derivePumpSwapPoolPDA(tokenMint);
+      const poolAccount = await connection.getAccountInfo(poolPDA, 'processed');
+      
+      if (poolAccount) {
+        console.log(`[pump-trading] Found graduated pool using PDA: ${poolPDA.toBase58()}`);
+        return poolPDA.toBase58();
+      }
+
+      // Fallback to program accounts search
+      const mint = new PublicKey(tokenMint);
+      const accounts = await connection.getProgramAccounts(PUMPSWAP_PROGRAM_ID, {
+        filters: [
+          {
+            dataSize: 200 // Adjust based on actual account size
+          },
+          {
+            memcmp: {
+              offset: 8, // tokenMint offset (after 8-byte discriminator)
+              bytes: mint.toBase58()
+            }
+          }
+        ]
+      });
+
+      if (accounts.length > 0) {
+        const poolAddress = accounts[0].pubkey.toBase58();
+        console.log(`[pump-trading] Found graduated pool via search: ${poolAddress}`);
+        return poolAddress;
+      }
+
+      throw new Error('No PumpSwap pool found for graduated token');
+    } catch (error) {
+      console.error('[pump-trading] Error finding graduated pool:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Test RPC connection and verify PumpSwap program access
+   */
+  async function testRPCConnection() {
+    try {
+      console.log('[pump-trading] Testing RPC connection...');
+      
+      // Test basic connection
+      const version = await connection.getVersion();
+      console.log(`[pump-trading] RPC version: ${version['solana-core']}`);
+      
+      // Test PumpSwap program access
+      const programAccount = await connection.getAccountInfo(PUMPSWAP_PROGRAM_ID, 'processed');
+      if (!programAccount) {
+        throw new Error('PumpSwap program not found on this RPC');
+      }
+      console.log(`[pump-trading] PumpSwap program found: ${PUMPSWAP_PROGRAM_ID.toBase58()}`);
+      
+      // Test program accounts access
+      const accounts = await connection.getProgramAccounts(PUMPSWAP_PROGRAM_ID, {
+        dataSlice: { offset: 0, length: 8 }, // Just get discriminator
+        limit: 1
+      });
+      console.log(`[pump-trading] Found ${accounts.length} PumpSwap accounts`);
+      
+      return true;
+    } catch (error) {
+      console.error('[pump-trading] RPC connection test failed:', error);
+      throw error;
+    }
+  }
+
   return {
     buyPumpswap,
     sellPumpswap,
     getPoolInfo,
     getPoolData,
+    getGraduatedPoolAddress,
+    testRPCConnection,
     calculateSwapAmountOut,
     calculateSwapAmountIn
   };
